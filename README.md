@@ -21,7 +21,7 @@ No extra dependencies are required. The nodes appear under the
 
 ### Text Encode MOSS-Image Ostris Edit
 
-Inputs: `clip`, `prompt`, optional `vae` and `image1`..`image3`.
+Inputs: `clip`, `prompt`, optional `vae`, `image1`, `mask1`, `image2`, `image3`.
 Output: `CONDITIONING`.
 
 Encodes the prompt together with the reference images through the MOSS-Image
@@ -36,6 +36,14 @@ resolution the image is fed in (only snapped to the FLUX.2 VAE's 16 px grid):
 **scale the reference yourself before this node** — the example workflow
 runs it through `FluxKontextImageScale` (about 1MP, the training default).
 A 1024x1024 reference adds 4096 tokens to every step; a 512x512 one 1024.
+
+`mask1` places image1 in the output. Reference and output share a centered
+coordinate grid, so a reference the size of the output lines up with it
+pixel for pixel. Pad image1 to the output size with the subject where you want
+it, and mask the padding (1 = masked, e.g. the transparent area from Load
+Image's `MASK`). Masked 16 px latent cells are dropped from the reference, the
+kept ones keep their positions, and the model generates the masked area. The
+Qwen3.5 encoder sees image1 cropped to the unmasked area.
 
 Note: the text encoder checkpoint must include the Qwen3.5 vision weights
 (the Comfy-Org `qwen3.5_9b_*` files do) or the images cannot be encoded.
