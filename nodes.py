@@ -76,6 +76,24 @@ def _snap(samples, snap):
     return comfy.utils.common_upscale(samples, nw, nh, "area", "disabled")
 
 
+def _image_mask(mask, samples):
+    """MASK (B, H, W) -> (1, 1, H, W) at the image's size, averaged over the batch."""
+    mask = mask.reshape(-1, 1, mask.shape[-2], mask.shape[-1]).mean(0, keepdim=True).to(samples.device)
+    if mask.shape[-2:] != samples.shape[-2:]:
+        mask = torch.nn.functional.interpolate(mask, size=samples.shape[-2:], mode="bilinear")
+    return mask
+
+
+def _crop_visible(samples, mask):
+    """Crop a (B, C, H, W) image to the bounding box of its unmasked pixels."""
+    visible = mask[0, 0] < 0.5
+    rows = torch.where(visible.any(1))[0]
+    cols = torch.where(visible.any(0))[0]
+    if len(rows) == 0:
+        return samples
+    return samples[:, :, int(rows[0]):int(rows[-1]) + 1, int(cols[0]):int(cols[-1]) + 1]
+
+
 class TextEncodeMOSSImageOstrisEdit:
     @classmethod
     def INPUT_TYPES(cls):
@@ -87,6 +105,18 @@ class TextEncodeMOSSImageOstrisEdit:
             "optional": {
                 "vae": ("VAE",),
                 "image1": ("IMAGE",),
+                "mask1": (
+                    "MASK",
+                    {
+                        "tooltip": (
+                            "Optional mask for image1. Masked areas (1, e.g. the "
+                            "transparent area from Load Image) are dropped from the "
+                            "reference so the model generates them; the rest keeps "
+                            "its position. The text encoder sees image1 cropped to "
+                            "the unmasked area."
+                        ),
+                    },
+                ),
                 "image2": ("IMAGE",),
                 "image3": ("IMAGE",),
             },
@@ -103,20 +133,30 @@ class TextEncodeMOSSImageOstrisEdit:
         "at the resolution they are fed in (scale them upstream; 1MP recommended)."
     )
 
-    def encode(self, clip, prompt, vae=None, image1=None, image2=None, image3=None):
+    def encode(self, clip, prompt, vae=None, image1=None, mask1=None, image2=None, image3=None):
         images_vl = []
         ref_latents = []
+        ref_masks = []
         image_prompt = ""
 
-        for image in (image1, image2, image3):
+        for image, mask in ((image1, mask1), (image2, None), (image3, None)):
             if image is None:
                 continue
             samples = image.movedim(-1, 1)
-            images_vl.append(_fit_area(samples, VLM_MAX_PIXELS).movedim(1, -1))
+            if mask is not None:
+                mask = _image_mask(mask, samples)
+            vl = samples if mask is None else _crop_visible(samples, mask)
+            images_vl.append(_fit_area(vl, VLM_MAX_PIXELS).movedim(1, -1))
             if vae is not None:
                 # no resize: the reference's resolution is the user's call
                 s = _snap(samples, REF_SNAP)
-                ref_latents.append(vae.encode(s.movedim(1, -1)[:, :, :, :3]))
+                latent = vae.encode(s.movedim(1, -1)[:, :, :, :3])
+                # a latent cell is kept when less than half of it is masked
+                keep = None if mask is None else torch.nn.functional.interpolate(mask, size=latent.shape[-2:], mode="area")[0, 0] < 0.5
+                # a fully masked reference adds no tokens
+                if keep is None or keep.any():
+                    ref_latents.append(latent)
+                    ref_masks.append(keep)
             image_prompt += (
                 "Picture {}: <|vision_start|><|image_pad|><|vision_end|>".format(
                     len(images_vl)
@@ -129,9 +169,11 @@ class TextEncodeMOSSImageOstrisEdit:
         tokens = clip.tokenize(image_prompt + prompt, images=images_vl)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
         if len(ref_latents) > 0:
-            conditioning = node_helpers.conditioning_set_values(
-                conditioning, {"reference_latents": ref_latents}, append=True
-            )
+            values = {"reference_latents": ref_latents}
+            if any(m is not None for m in ref_masks):
+                # aligned with reference_latents, None keeps the whole reference
+                values["reference_latent_masks"] = ref_masks
+            conditioning = node_helpers.conditioning_set_values(conditioning, values, append=True)
         return (conditioning,)
 
 
@@ -170,16 +212,23 @@ def _time_vec(dit, timestep, dtype):
     return dit.time_embedding(timestep_embedding(timestep, TIME_DIM).to(dtype))
 
 
-def _pack_refs(dit, ref_latents, bs, text_len, device, dtype):
-    """Reference latents -> tokens (B, Lr, C) + RoPE ids (Lr, 4)."""
+def _pack_refs(dit, ref_latents, ref_masks, bs, text_len, device, dtype):
+    """Reference latents -> tokens (B, Lr, C) + RoPE ids (Lr, 4). Tokens outside
+    a reference's keep mask are dropped; the kept ones keep their positions."""
     tokens, ids = [], []
     for i, ref in enumerate(ref_latents):
         if ref.ndim == 5 and ref.shape[2] == 1:
             ref = ref.squeeze(2)
         ref = comfy.utils.repeat_to_batch_size(ref.to(device, dtype), bs)
         rh, rw = ref.shape[-2], ref.shape[-1]
-        tokens.append(ref.flatten(2).transpose(1, 2))
-        ids.append(_image_ids(i + 1, text_len, rh, rw, device))
+        tok = ref.flatten(2).transpose(1, 2)
+        rid = _image_ids(i + 1, text_len, rh, rw, device)
+        keep = ref_masks[i] if ref_masks is not None and i < len(ref_masks) else None
+        if keep is not None:
+            keep = keep.to(device).flatten().bool()
+            tok, rid = tok[:, keep], rid[keep]
+        tokens.append(tok)
+        ids.append(rid)
     return torch.cat(tokens, dim=1), torch.cat(ids, dim=0)
 
 
@@ -288,7 +337,7 @@ def _finish(dit, h, vec, n_img, B, H, W):
     return out.transpose(1, 2).reshape(B, dit.latent_channels, H, W)
 
 
-def _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_options):
+def _forward_with_refs(dit, x, timestep, context, ref_latents, ref_masks, transformer_options):
     """MOSS-Image forward with reference latents appended after the text at
     t=0 ("index_timestep_zero"). Mirrors comfy.ldm.moss_image.model.MOSSImage._forward
     with the ref packing / per-span modulation additions."""
@@ -297,7 +346,7 @@ def _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_optio
     transformer_options = transformer_options.copy()
     n_img, text_len = H * W, context.shape[1]
 
-    reftok, refids = _pack_refs(dit, ref_latents, B, text_len, device, dtype)
+    reftok, refids = _pack_refs(dit, ref_latents, ref_masks, B, text_len, device, dtype)
     ids = torch.cat((_image_ids(0, text_len, H, W, device), _text_ids(text_len, device), refids), dim=0)
     pe = _pe(dit, ids)
 
@@ -321,7 +370,7 @@ def _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_optio
 # ---------------------------------------------------------------------------
 
 
-def _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, transformer_options):
+def _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, ref_masks, transformer_options):
     """Run only the clean reference tokens through the blocks at t=0 and record
     each block's post-RoPE K/V.
 
@@ -333,7 +382,7 @@ def _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, transformer_opti
     B = x.shape[0]
     dtype, device = x.dtype, x.device
     transformer_options = transformer_options.copy()
-    reftok, refids = _pack_refs(dit, ref_latents, B, text_len, device, dtype)
+    reftok, refids = _pack_refs(dit, ref_latents, ref_masks, B, text_len, device, dtype)
     pe = _pe(dit, refids)
     vec0 = _time_vec(dit, torch.zeros_like(timestep), dtype)
     mod0 = _modulation(dit, vec0)
@@ -375,15 +424,18 @@ def _forward_with_cached_refs(dit, x, timestep, context, ref_kv, transformer_opt
     return _finish(dit, h, vec, n_img, B, H, W)
 
 
-def _ref_fingerprint(ref_latents, bs, text_len, skipped):
+def _ref_fingerprint(ref_latents, ref_masks, bs, text_len, skipped):
     """Cheap content key for the ref K/V cache: batch size, text length (the
     refs' RoPE frame coordinate), skipped blocks, and per-ref shape plus two
     reduction sums (the ref tensors are rebuilt per step by comfy's cond
-    batching, so object identity can't be used)."""
+    batching, so object identity can't be used). Keep masks are keyed by their
+    kept cell indices."""
     key = [bs, text_len, skipped]
     for r in ref_latents:
         rf = r.float()
         key.append((tuple(r.shape), float(rf.sum()), float(rf.square().sum())))
+    for m in ref_masks or ():
+        key.append(None if m is None else tuple(m.flatten().bool().nonzero().flatten().tolist()))
     return tuple(key)
 
 
@@ -439,6 +491,11 @@ class MOSSImageOstrisEditModelPatch:
                 out["ref_latents"] = comfy.conds.CONDList(
                     [base_model.process_latent_in(lat) for lat in ref_latents]
                 )
+            ref_masks = kwargs.get("reference_latent_masks", None)
+            if ref_masks is not None:
+                # constant: only conds with identical masks batch together, so
+                # every sample in a batch keeps the same ref tokens
+                out["ref_latent_masks"] = comfy.conds.CONDConstant(ref_masks)
             return out
 
         def extra_conds_shapes(**kwargs):
@@ -458,11 +515,11 @@ class MOSSImageOstrisEditModelPatch:
         # blocks so cond/uncond coexist.
         state = {"last_sigma": None, "caches": {}}
 
-        def forward(x, timestep, context, transformer_options={}, ref_latents=None, **kwargs):
+        def forward(x, timestep, context, transformer_options={}, ref_latents=None, ref_latent_masks=None, **kwargs):
             if ref_latents is None or len(ref_latents) == 0:
                 return orig_forward(x, timestep, context, transformer_options=transformer_options, **kwargs)
             if not kv_cache:
-                return _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_options)
+                return _forward_with_refs(dit, x, timestep, context, ref_latents, ref_latent_masks, transformer_options)
 
             # New-run detection: sigmas only decrease within a run, and the
             # first call of a run sits at sample_sigmas[0] when available.
@@ -476,10 +533,10 @@ class MOSSImageOstrisEditModelPatch:
             state["last_sigma"] = sig
 
             text_len = context.shape[1]
-            key = _ref_fingerprint(ref_latents, x.shape[0], text_len, _skipped_blocks(transformer_options))
+            key = _ref_fingerprint(ref_latents, ref_latent_masks, x.shape[0], text_len, _skipped_blocks(transformer_options))
             ref_kv = state["caches"].get(key)
             if ref_kv is None:
-                ref_kv = _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, transformer_options)
+                ref_kv = _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, ref_latent_masks, transformer_options)
                 state["caches"][key] = ref_kv
             return _forward_with_cached_refs(dit, x, timestep, context, ref_kv, transformer_options)
 
