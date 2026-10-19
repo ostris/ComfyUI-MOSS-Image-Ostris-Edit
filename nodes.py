@@ -38,6 +38,7 @@ import math
 import torch
 
 import comfy.conds
+import comfy.ldm.flux.math
 import comfy.model_prefetch
 import comfy.utils
 import node_helpers
@@ -159,7 +160,10 @@ def _text_ids(text_len, device):
 
 
 def _pe(dit, ids):
-    return dit.pe_embedder(ids.unsqueeze(0)).transpose(1, 2).contiguous()
+    # same per-axis rope as MOSSImage.rope() (core dropped pe_embedder for rope scaling)
+    ids = ids.unsqueeze(0)
+    pe = torch.cat([comfy.ldm.flux.math.rope(ids[..., i], d, 10000) for i, d in enumerate(dit.rope_axes_dim)], dim=-3)
+    return pe.unsqueeze(1).transpose(1, 2).contiguous()
 
 
 def _modulation(dit, vec):
