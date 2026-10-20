@@ -160,10 +160,13 @@ def _text_ids(text_len, device):
 
 
 def _pe(dit, ids):
-    # same per-axis rope as MOSSImage.rope() (core dropped pe_embedder for rope scaling)
     ids = ids.unsqueeze(0)
-    pe = torch.cat([comfy.ldm.flux.math.rope(ids[..., i], d, 10000) for i, d in enumerate(dit.rope_axes_dim)], dim=-3)
-    return pe.unsqueeze(1).transpose(1, 2).contiguous()
+    if hasattr(dit, "pe_embedder"):  # ComfyUI <= v0.42.1
+        pe = dit.pe_embedder(ids)
+    else:
+        # same per-axis rope as MOSSImage.rope() (core dropped pe_embedder for rope scaling)
+        pe = torch.cat([comfy.ldm.flux.math.rope(ids[..., i], d, 10000) for i, d in enumerate(dit.rope_axes_dim)], dim=-3).unsqueeze(1)
+    return pe.transpose(1, 2).contiguous()
 
 
 def _modulation(dit, vec):
