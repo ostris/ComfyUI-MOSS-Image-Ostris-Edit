@@ -40,6 +40,7 @@ import torch
 import comfy.conds
 import comfy.model_prefetch
 import comfy.utils
+import comfy.ldm.flux.math
 import node_helpers
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.modules.attention import optimized_attention
@@ -159,7 +160,16 @@ def _text_ids(text_len, device):
 
 
 def _pe(dit, ids):
-    return dit.pe_embedder(ids.unsqueeze(0)).transpose(1, 2).contiguous()
+    # ComfyUI refactored MOSSImage into ``comfy.ldm.moss_image.model`` and dropped
+    # the standalone ``pe_embedder``: RoPE is now built from ``rope_axes_dim`` via
+    # ``comfy.ldm.flux.math.rope`` (see ``MOSSImage.rope``). Reproduce that here
+    # for arbitrary ids, since ``MOSSImage.rope`` only generates its own ids.
+    # Keep the legacy path for older ComfyUI builds that still expose pe_embedder.
+    if hasattr(dit, "pe_embedder"):
+        return dit.pe_embedder(ids.unsqueeze(0)).transpose(1, 2).contiguous()
+    ids_b = ids.unsqueeze(0)
+    pe = torch.cat([comfy.ldm.flux.math.rope(ids_b[..., i], d, 10000) for i, d in enumerate(dit.rope_axes_dim)], dim=-3)
+    return pe.unsqueeze(1).transpose(1, 2).contiguous()
 
 
 def _modulation(dit, vec):
